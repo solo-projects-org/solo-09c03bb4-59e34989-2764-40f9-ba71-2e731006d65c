@@ -6,3 +6,6 @@ data/
 *.db-wal
 *.db-shm
 .venv/
+# 大文件样例按需生成，不纳入版本库
+sample_data/large_demo.csv
+sample_data/custom_demo.csv

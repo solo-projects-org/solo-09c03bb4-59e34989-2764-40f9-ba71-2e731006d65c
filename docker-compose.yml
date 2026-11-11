@@ -5,9 +5,14 @@ services:
     container_name: pump-hammer-api
     ports:
       - "8000:8000"
+    # 与服务设计一致：整个容器限制在 256 MiB（禁用 swap），
+    # 用于验证 200 万行 CSV 仍可流式导入。
+    mem_limit: 256m
+    memswap_limit: 256m
     environment:
       PUMP_DB_PATH: /data/pump_tests.db
       PUMP_BLOCK_SIZE: "128"
+      PUMP_MAX_UPLOAD_BYTES: "209715200"
     volumes:
       - pump-data:/data
     restart: unless-stopped

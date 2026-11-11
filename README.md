@@ -11,7 +11,12 @@ FastAPI 服务，采样与多级摘要落盘到 **SQLite**；复盘时给定起�
     （`timestamp_ms / ts / 时间戳 …`、`pressure_kpa / pressure / 压力(kPa) …`），
     UTF-8 与 GBK 编码均可
   - 毫秒时间戳必须为整数且**严格递增**，重复或倒序整次拒绝（HTTP 400）
-  - 压力为有限数值，单位 kPa；单事务写入，失败不留半成品
+  - 压力为有限数值，单位 kPa
+  - **流式导入**：CSV 按行解码读取、采样分批写入、摘要分块构建，
+    内存占用与文件行数基本无关；256 MiB 内存限制下可一次导入
+    200 万行时间戳 + 压力数据
+  - 试验信息、采样和各级摘要处于同一事务：最后一行才出错也会整次回滚，
+    不留任何部分数据
 - **分桶查询**（`GET /tests/{id}/query`）
   - 从 `start_ts` 起按 `bucket_width_ms` 分桶，**含左端、不含右端**，
     末桶截到 `end_ts`
@@ -32,14 +37,14 @@ FastAPI 服务，采样与多级摘要落盘到 **SQLite**；复盘时给定起�
 app/
   config.py      环境变量配置（库路径、块大小、上传上限、桶数上限）
   db.py          SQLite 连接、建表（tests / samples / blocks）
-  ingest.py      CSV 解析、严格校验、导入
-  summaries.py  多级摘要构建与区间递归查询
+  ingest.py      CSV 流式解析、严格校验、分批导入
+  summaries.py   多级摘要流式构建与区间递归查询
   service.py     分桶编排、点去重与角色合并
   schemas.py     Pydantic 请求 / 响应模型
   main.py        FastAPI 路由
 sample_data/     样例 CSV（由 scripts/generate_sample.py 生成）
 scripts/         样例生成脚本
-tests/           pytest 测试（18 项）
+tests/           pytest 测试
 Dockerfile, docker-compose.yml
 ```
 
@@ -53,6 +58,8 @@ docker compose up --build
 - Swagger UI：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
 - SQLite 数据保存在命名卷 `pump-data`（容器内 `/data/pump_tests.db`）
+- Compose 已设置 `mem_limit: 256m`（`memswap_limit` 同为 256m），
+  即服务确实在 256 MiB 内存上限内运行
 
 ## 复现样例试验
 
@@ -63,7 +70,13 @@ docker compose up --build
 python3 scripts/generate_sample.py
 ```
 
-在 Swagger（`/docs`）中的操作步骤：
+生成用于验证大文件流式导入的 200 万行样例（约 40 MiB）：
+
+```bash
+python3 scripts/generate_sample.py --rows 2000000 --out sample_data/large_demo.csv
+```
+
+该文件未纳入版本库，按需生成即可。在 Swagger（`/docs`）中的操作步骤：
 
 1. `POST /tests/import`：`name` 填 `demo-001`，`file` 选择
    `sample_data/pump_start_demo.csv`，执行。响应返回试验 id、时间范围与各级块数。
@@ -76,6 +89,8 @@ python3 scripts/generate_sample.py
    - 换 `start_ts=1731299990000&end_ts=1731299995000` 可看到全部桶 `missing=true`。
 
 小样本 `sample_data/small_demo.csv`（60 点）适合在 Swagger 里肉眼逐桶核对。
+若上一步换用 200 万行 `large_demo.csv`，时间戳基准相同，上述查询参数可直接
+复用（例如查询前 2 秒：`start_ts=1731300000000&end_ts=1731300019999`）。
 
 ### curl 示例
 

@@ -101,79 +101,155 @@ def merge_stats(a: Stats, b: Stats) -> Stats:
     )
 
 
-def build_summaries(conn: sqlite3.Connection, test_id: int, block_size: int) -> int:
+_INSERT_BLOCK_SQL = f"""INSERT INTO blocks (
+        test_id, level, block_index,
+        start_ts, end_ts,
+        {", ".join(_BLOCK_FIELDS)},
+        first_rowid, last_rowid
+    ) VALUES (
+        ?, ?, ?, ?, ?,
+        {", ".join("?" for _ in _BLOCK_FIELDS)},
+        ?, ?
+    )"""
+
+
+def _insert_block(
+    conn: sqlite3.Connection,
+    test_id: int,
+    level: int,
+    block_index: int,
+    entry: tuple,
+) -> None:
+    st, first_rid, last_rid = entry
+    conn.execute(
+        _INSERT_BLOCK_SQL,
+        (
+            test_id,
+            level,
+            block_index,
+            st.first_ts,
+            st.last_ts,
+            *st.to_tuple(),
+            first_rid,
+            last_rid,
+        ),
+    )
+
+
+def _iter_level1_blocks(
+    conn: sqlite3.Connection,
+    test_id: int,
+    block_size: int,
+    first_rowid: int,
+    last_rowid: int,
+):
+    """逐块扫描原始采样，写入并产出 level 1 摘要块。
+
+    每次只取最多 block_size 行，因此内存不随试验采样数增长。块写完后才
+    产出，供更高层生成器按 block_size 个一组消费。
+    """
+    next_rowid = first_rowid
+    index = 0
+    while next_rowid <= last_rowid:
+        rows = conn.execute(
+            """SELECT rowid AS rid, ts, pressure FROM samples NOT INDEXED
+               WHERE test_id = ? AND rowid >= ? AND rowid <= ?
+               ORDER BY rowid LIMIT ?""",
+            (test_id, next_rowid, last_rowid, block_size),
+        ).fetchall()
+        if not rows:
+            break
+        acc = Stats()
+        for row in rows:
+            acc = merge_stats(acc, stats_from_sample(row["ts"], row["pressure"]))
+        entry = (acc, rows[0]["rid"], rows[-1]["rid"])
+        _insert_block(conn, test_id, 1, index, entry)
+        yield entry
+        index += 1
+        next_rowid = rows[-1]["rid"] + 1
+
+
+def _iter_merged_blocks(
+    conn: sqlite3.Connection,
+    test_id: int,
+    level: int,
+    block_size: int,
+    children,
+):
+    """把下一级块按 block_size 个一组流式合并，写入并产出本级块。"""
+    acc = Stats()
+    first_rid: Optional[int] = None
+    last_rid: Optional[int] = None
+    count = 0
+    index = 0
+    for child_stats, child_first_rid, child_last_rid in children:
+        if first_rid is None:
+            first_rid = child_first_rid
+        acc = merge_stats(acc, child_stats)
+        last_rid = child_last_rid
+        count += 1
+        if count == block_size:
+            entry = (acc, first_rid, last_rid)
+            _insert_block(conn, test_id, level, index, entry)
+            yield entry
+            index += 1
+            acc = Stats()
+            first_rid = None
+            last_rid = None
+            count = 0
+    if count:
+        entry = (acc, first_rid, last_rid)
+        _insert_block(conn, test_id, level, index, entry)
+        yield entry
+
+
+def build_summaries(
+    conn: sqlite3.Connection,
+    test_id: int,
+    block_size: int,
+    first_rowid: int | None = None,
+    last_rowid: int | None = None,
+    sample_count: int | None = None,
+) -> int:
     """为已写入 samples 的试验构建全部摘要层级，返回最高 level。
 
-    调用方负责事务管理；level 1 块直接按 rowid 序号分块聚合，
-    之后逐层合并子块，直到只剩一个块。
+    调用方负责事务管理。采样按块流式扫描，层与层之间通过生成器逐块合并，
+    内存只保留当前聚合块与每层一个累加器，不加载全部采样或全部块。
     """
-    cur = conn.execute(
-        "SELECT rowid AS rid, ts, pressure FROM samples WHERE test_id = ? ORDER BY rowid",
-        (test_id,),
-    )
-    rows = cur.fetchall()
-    if not rows:
+    if block_size <= 0:
+        raise ValueError("block_size 必须为正整数")
+    if sample_count is None:
+        sample_count = conn.execute(
+            "SELECT COUNT(*) FROM samples WHERE test_id = ?", (test_id,)
+        ).fetchone()[0]
+    if not sample_count:
         return 0
+    if first_rowid is None or last_rowid is None:
+        row = conn.execute(
+            "SELECT MIN(rowid) AS lo, MAX(rowid) AS hi FROM samples WHERE test_id = ?",
+            (test_id,),
+        ).fetchone()
+        first_rowid, last_rowid = row["lo"], row["hi"]
 
-    level_rows: list[tuple] = []  # (stats, first_rowid, last_rowid)
+    # 由采样数预先算出层数：level 1 每块 block_size 点，之后每层 block_size 个
+    # 子块合并为一块，直到只剩一块（与原先 while len(prev) > 1 一致）。
+    levels = 1
+    block_count = (sample_count + block_size - 1) // block_size
+    while block_count > 1 and block_size > 1:
+        block_count = (block_count + block_size - 1) // block_size
+        levels += 1
 
-    def flush(level: int, entries: list[tuple]) -> None:
-        for idx, (st, first_rid, last_rid) in enumerate(entries):
-            conn.execute(
-                f"""INSERT INTO blocks (
-                        test_id, level, block_index,
-                        start_ts, end_ts,
-                        {", ".join(_BLOCK_FIELDS)},
-                        first_rowid, last_rowid
-                    ) VALUES (
-                        ?, ?, ?, ?, ?,
-                        {", ".join("?" for _ in _BLOCK_FIELDS)},
-                        ?, ?
-                    )""",
-                (
-                    test_id,
-                    level,
-                    idx,
-                    st.first_ts,
-                    st.last_ts,
-                    *st.to_tuple(),
-                    first_rid,
-                    last_rid,
-                ),
-            )
-
-    # ---- level 1：原始采样分块 ----
-    entries: list[tuple] = []
-    acc = Stats()
-    block_first_rid = rows[0]["rid"]
-    for i, row in enumerate(rows):
-        st = stats_from_sample(row["ts"], row["pressure"])
-        acc = merge_stats(acc, st)
-        if (i + 1) % block_size == 0:
-            entries.append((acc, block_first_rid, row["rid"]))
-            acc = Stats()
-            block_first_rid = rows[i + 1]["rid"] if i + 1 < len(rows) else row["rid"]
-    if acc.sample_count:
-        entries.append((acc, block_first_rid, rows[-1]["rid"]))
-    flush(1, entries)
-    max_level = 1
-
-    # ---- level 2+：逐层合并上一级块 ----
-    prev = entries
-    while len(prev) > 1:
-        level = max_level + 1
-        cur_entries: list[tuple] = []
-        for i in range(0, len(prev), block_size):
-            group = prev[i : i + block_size]
-            st = Stats()
-            for child_st, _, _ in group:
-                st = merge_stats(st, child_st)
-            cur_entries.append((st, group[0][1], group[-1][2]))
-        flush(level, cur_entries)
-        prev = cur_entries
-        max_level = level
-
-    return max_level
+    # 生成器链：消费最上层时逐级拉取，所有层级的块边生成边写入。
+    children = _iter_level1_blocks(
+        conn, test_id, block_size, first_rowid, last_rowid
+    )
+    level = 1
+    while level < levels:
+        level += 1
+        children = _iter_merged_blocks(conn, test_id, level, block_size, children)
+    for _ in children:
+        pass
+    return levels
 
 
 def range_summary(

@@ -98,6 +98,53 @@ def test_duplicate_name_rejected(imported):
     assert resp.status_code == 400
 
 
+def test_import_accepts_gbk_with_chinese_header():
+    rows = [(1000 + i * 10, 100.5 + i) for i in range(20)]
+    text = "时间戳,压力(kPa)\n" + "".join(f"{ts},{p}\n" for ts, p in rows)
+    resp = client.post(
+        "/tests/import",
+        data={"name": "gbk-test"},
+        files={"file": ("gbk.csv", text.encode("gbk"), "text/csv")},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["sample_count"] == 20
+    q = client.get(
+        f"/tests/{body['id']}/query",
+        params={"start_ts": 1000, "end_ts": 1200, "bucket_width_ms": 100},
+    ).json()
+    assert q["buckets"][0]["points"][0]["pressure"] == 100.5
+
+
+def test_last_line_error_leaves_no_partial_data():
+    """整个导入在同一事务内：最后一行失败也不能留下试验/采样/摘要。"""
+    good = "timestamp_ms,pressure_kpa\n" + "".join(
+        f"{i * 10},{i}\n" for i in range(20)
+    )
+    bad = good + "999,not-a-number\n"
+    resp = client.post(
+        "/tests/import",
+        data={"name": "atomic-test"},
+        files={"file": ("bad.csv", bad.encode(), "text/csv")},
+    )
+    assert resp.status_code == 400
+    conn = connect()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tests WHERE name = 'atomic-test'"
+    ).fetchone()[0] == 0
+    # 唯一一个 atomic-test 若曾插入又回滚，其采样/摘要也不应残留
+    orphan_samples = conn.execute(
+        "SELECT COUNT(*) FROM samples s LEFT JOIN tests t ON t.id = s.test_id "
+        "WHERE t.id IS NULL"
+    ).fetchone()[0]
+    orphan_blocks = conn.execute(
+        "SELECT COUNT(*) FROM blocks b LEFT JOIN tests t ON t.id = b.test_id "
+        "WHERE t.id IS NULL"
+    ).fetchone()[0]
+    assert orphan_samples == 0 and orphan_blocks == 0
+    conn.close()
+
+
 def test_bucket_aligned_with_blocks_uses_only_summaries(imported):
     # 桶边界与 level1 块完全对齐：不应读取任何原始采样
     resp = client.get(

@@ -57,16 +57,22 @@ def upload_test(
     name: str = Form(..., description="试验名称，库内唯一"),
     conn: Connection = Depends(get_conn),
 ):
-    content = file.file.read(config.MAX_UPLOAD_BYTES + 1)
-    if len(content) > config.MAX_UPLOAD_BYTES:
+    # 只做 seek/tell 取大小，不把文件读进内存；实际上传由 ingest 流式解码。
+    fileobj = file.file
+    fileobj.seek(0, 2)
+    size = fileobj.tell()
+    fileobj.seek(0)
+    if size > config.MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,
             detail=f"文件超过 {config.MAX_UPLOAD_BYTES} 字节上限",
         )
-    if not content:
+    if size == 0:
         raise HTTPException(status_code=400, detail="上传文件为空")
     try:
-        result = import_test(conn, name=name, filename=file.filename or "", content=content)
+        result = import_test(
+            conn, name=name, filename=file.filename or "", content=fileobj
+        )
     except CsvValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return result

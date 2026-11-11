@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    MALLOC_ARENA_MAX=2 \
     PUMP_DB_PATH=/data/pump_tests.db
 
 WORKDIR /app
